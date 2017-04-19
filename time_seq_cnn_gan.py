@@ -6,7 +6,7 @@ import tensorflow.contrib.distributions as tfcd
 import numpy as np
 import random, itertools, os
 
-load_from = None
+load_from = '../models/chargan/'
 save_to = '../models/chargan/'
 log_dir = '../log/tflogs4/'
 
@@ -18,7 +18,7 @@ num_layers = 10
 filt_size = 5
 state_size = 2 ** (num_layers - 1) * (filt_size - 1)
 hidden_size = 200
-batch_size = 5
+batch_size = 10
 num_critic = 1
 clip = 0.01
 learning_rate = 5e-5
@@ -28,7 +28,7 @@ def normalize(x, axis, prefix="", eps=1e-05, beta=0.1):
     gain = tf.get_variable(prefix + "gain", var_shape,
     initializer=tf.constant_initializer(1))
     bias = tf.get_variable(prefix + "bias", var_shape,
-    initializer=tf.constant_initializer(0))
+    initializer =tf.constant_initializer(0))
     mean, var = tf.nn.moments(x, [axis], keep_dims=True)
     out = (x - mean) / tf.sqrt(var + eps) * beta
     out = out * gain + bias
@@ -128,15 +128,15 @@ build_gen_model = tf.make_template('gen', build_gen_model)
 build_critic_model = tf.make_template('critic', build_critic_model)
 
 # Critic
+real = tf.reduce_mean(build_critic_model(x, y))
 c_params = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope="critic")
 with tf.variable_scope('clip'):
     clipped = [p.assign(tf.clip_by_value(p, -clip, clip)) for p in c_params]
 
 with tf.control_dependencies(clipped):
-    real = build_critic_model(x, y)
     gen, next_c_state = build_gen_model(x, noise, state)
-    fake = build_critic_model(x, gen)
-    C = tf.reduce_mean(fake - real)
+    fake = tf.reduce_mean(build_critic_model(x, gen))
+    C = fake - real
     c_optimizer = tf.train.RMSPropOptimizer(learning_rate)
     c_train_step = c_optimizer.minimize(C, var_list=c_params)
 
