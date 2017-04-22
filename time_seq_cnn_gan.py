@@ -6,19 +6,19 @@ import tensorflow.contrib.distributions as tfcd
 import numpy as np
 import random, itertools, os
 
-load_from = '../models/chargan/'
-save_to = '../models/chargan/'
-log_dir = '../log/tflogs4/'
+load_from = None#'../models/chargan/'
+save_to = '../models/chargan_block/'
+log_dir = '../log/tflogs5/'
 
-seq_size = 1024
 voca = " 0123456789abcdefghijklmnopqrstuvwxyz" \
     + "ABCDEFGHIJKLMNOPQRSTUVWXYZ.!;:,?&$'-\n"
 dic = {voca[i]: i for i in range(len(voca))}
-num_layers = 10
-filt_size = 5
+num_layers = 9
+filt_size = 7
+seq_size = (2 ** num_layers - 1) * (filt_size - 1) + 1
 state_size = 2 ** (num_layers - 1) * (filt_size - 1)
 hidden_size = 200
-batch_size = 10
+batch_size = 5
 num_critic = 1
 clip = 0.01
 learning_rate = 5e-5
@@ -38,7 +38,7 @@ def init_with_variance(var):
     return tf.random_normal_initializer(stddev=np.sqrt(var))
 
 # Model
-def build_gen_model(x, z, state):
+def build_gen_model(x, z):
     with tf.variable_scope("pre"):
         x = tf.concat([x, z], 2)
         filt = tf.get_variable("filt", [1, len(voca) + 1, hidden_size * 2],
@@ -59,7 +59,7 @@ def build_gen_model(x, z, state):
             filt = tf.get_variable("filt",
                 [filt_size, hidden_size, hidden_size * 2],
                 initializer=init_with_variance(2 / hidden_size))
-            act = tf.concat([state[:, n, -l:], act], 1)
+            act = tf.pad(act, [[0, 0], [l, 0], [0, 0]])
             conv = tf.nn.convolution(act, filt, "VALID", dilation_rate=[r])
             # Residual Skip Connection
             skip += conv
@@ -76,6 +76,7 @@ def build_gen_model(x, z, state):
     return out, tf.stack(next_state)
 
 def build_critic_model(x, y):
+    print(seq_size, x.get_shape())
     with tf.variable_scope("pre"):
         x = tf.concat([x, y], 2)
         filt = tf.get_variable("filt", [1, len(voca) * 2, hidden_size * 2],
@@ -84,7 +85,7 @@ def build_critic_model(x, y):
     for n in range(num_layers):
         with tf.variable_scope("main{}".format(n)):
             r = 2 ** n
-            l = r * (filt_size - 1) + 1
+            l = r * (filt_size - 1)
             norm = normalize(skip, 2)
             # Gated Linear Unit
             A = norm[:, :, :hidden_size]
@@ -94,32 +95,14 @@ def build_critic_model(x, y):
             filt = tf.get_variable("filt",
                 [filt_size, hidden_size, hidden_size * 2],
                 initializer=init_with_variance(2 / hidden_size))
-            act = tf.pad(act, [[0, 0], [l - 1, 0], [0, 0]])
             conv = tf.nn.convolution(act, filt, "VALID", dilation_rate=[r])
             # Residual Skip Connection
-            skip += conv
-    with tf.variable_scope("post{}".format(n)):
-        norm = normalize(skip, 2)
-        # ReLU Activation
-        act = tf.nn.relu(norm)
-        # 1x1 Convolution
-        filt = tf.get_variable("filt",
-            [1, hidden_size * 2, hidden_size],
-            initializer=init_with_variance(1 / hidden_size))
-        conv = tf.nn.convolution(act, filt, "VALID")
-        # Average up
-        avg = normalize(tf.reduce_mean(conv, axis=1), 1, "avg")
-        act = tf.nn.relu(avg)
-        W = tf.get_variable("W", [hidden_size, 1],
-            initializer=init_with_variance(1 / hidden_size))
-        out = tf.matmul(act, W)
-    return out
+            skip = skip[:, l:] + conv
+    return conv
 
 global_step = tf.get_variable("step", [], initializer=tf.zeros_initializer())
-state = tf.placeholder(tf.float32, 
-        [None, num_layers, state_size, hidden_size], "state")
-data = tf.placeholder(tf.int32, [None, seq_size], "data")
-noise = tf.random_normal([tf.shape(data)[0], seq_size - 1, 1])
+data = tf.placeholder(tf.int32, [None, seq_size + 1], "data")
+noise = tf.random_normal([tf.shape(data)[0], seq_size, 1])
 one_hot = tf.one_hot(data, len(voca))
 x = one_hot[:, :-1]
 y = one_hot[:, 1:]
@@ -134,7 +117,7 @@ with tf.variable_scope('clip'):
     clipped = [p.assign(tf.clip_by_value(p, -clip, clip)) for p in c_params]
 
 with tf.control_dependencies(clipped):
-    gen, next_c_state = build_gen_model(x, noise, state)
+    gen, next_c_state = build_gen_model(x, noise)
     fake = tf.reduce_mean(build_critic_model(x, gen))
     C = fake - real
     c_optimizer = tf.train.RMSPropOptimizer(learning_rate)
@@ -147,7 +130,7 @@ c_summ = tf.summary.merge([
     ])
 
 # Generator
-gen, next_g_state = build_gen_model(x, noise, state)
+gen, next_g_state = build_gen_model(x, noise)
 G = tf.reduce_mean(-build_critic_model(x, gen))
 
 g_params = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope="gen")
@@ -163,7 +146,7 @@ g_summ = tf.summary.merge([
 seed = tf.placeholder(tf.int32, [1], "seed")
 seed_one_hot = tf.one_hot(seed[None, :], len(voca))
 noise = tf.random_normal([1, 1, 1])
-pred, next_state = build_gen_model(seed_one_hot, noise, state)
+pred, next_state = build_gen_model(seed_one_hot, noise)
 
 # Training
 saver = tf.train.Saver()
@@ -200,18 +183,20 @@ def sample_from_model(length):
         d = np.append(d, dn, axis=0)
         s = np.append(s[:, 1:], sn[:, 0], axis=1)
     return "".join(voca[int(n)] for n in d)
-print(sample_from_model(100))
+#print(sample_from_model(100))
 
 with open('shakespeare.txt') as f:
     dataset = f.read()
     dataset = [dic[c] for c in dataset]
 
-while True:
-    feed_state = np.zeros([batch_size, num_layers, state_size, hidden_size])
+def fetch_data():
+    s = random.sample(range(len(dataset) - seq_size - 1), batch_size)
+    feed = {data: [dataset[s:s + seq_size + 1] for s in s]}
+    return feed
 
+while True:
     # Train Generator
-    s = random.sample(range(len(dataset) - seq_size), batch_size)
-    feed = {data: [dataset[s:s + seq_size] for s in s], state: feed_state}
+    feed = fetch_data()
     evals = [g_train_step, G, g_summ, global_step, sample]
     _, g, summ, step, s = sess.run(evals, feed_dict=feed)
     train_writer.add_summary(summ, step)
@@ -220,8 +205,7 @@ while True:
 
     # Train Critic
     for i in range(num_critic):
-        s = random.sample(range(len(dataset) - seq_size), batch_size)
-        feed = {data: [dataset[s:s + seq_size] for s in s], state: feed_state}
+        feed = fetch_data()
         _, c, summ = sess.run([c_train_step, C, c_summ], feed_dict=feed)
     train_writer.add_summary(summ, step)
     print(step, c)
