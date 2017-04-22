@@ -6,8 +6,9 @@ import tensorflow.contrib.distributions as tfcd
 import numpy as np
 import random, itertools, os
 
-load_from = None#'../models/chargan/'
+load_from = None
 save_to = '../models/chargan_block/'
+#load_from = save_to
 log_dir = '../log/tflogs5/'
 
 voca = " 0123456789abcdefghijklmnopqrstuvwxyz" \
@@ -15,20 +16,22 @@ voca = " 0123456789abcdefghijklmnopqrstuvwxyz" \
 dic = {voca[i]: i for i in range(len(voca))}
 num_layers = 9
 filt_size = 7
-seq_size = (2 ** num_layers - 1) * (filt_size - 1) + 1
-state_size = 2 ** (num_layers - 1) * (filt_size - 1)
+input_size = (2 ** (num_layers - 1) - 1) * (filt_size - 1) + 1
+output_size = (2 ** (num_layers - 1)) * (filt_size - 1)
+seq_size = input_size + output_size
 hidden_size = 200
+num_post = 3
 batch_size = 5
-num_critic = 1
+num_critic = 3
 clip = 0.01
 learning_rate = 5e-5
 
 def normalize(x, axis, prefix="", eps=1e-05, beta=0.1):
     var_shape = [x.get_shape()[axis]]
     gain = tf.get_variable(prefix + "gain", var_shape,
-    initializer=tf.constant_initializer(1))
+        initializer=tf.constant_initializer(1))
     bias = tf.get_variable(prefix + "bias", var_shape,
-    initializer =tf.constant_initializer(0))
+        initializer=tf.constant_initializer(0))
     mean, var = tf.nn.moments(x, [axis], keep_dims=True)
     out = (x - mean) / tf.sqrt(var + eps) * beta
     out = out * gain + bias
@@ -38,15 +41,13 @@ def init_with_variance(var):
     return tf.random_normal_initializer(stddev=np.sqrt(var))
 
 # Model
-def build_gen_model(x, z):
+def build_gen_model(x):
     with tf.variable_scope("pre"):
-        x = tf.concat([x, z], 2)
-        filt = tf.get_variable("filt", [1, len(voca) + 1, hidden_size * 2],
+        filt = tf.get_variable("filt", [1, len(voca), hidden_size * 2],
             initializer=tf.random_normal_initializer())
         skip = tf.nn.convolution(x, filt, "VALID")
-    next_state = []
-    for n in range(num_layers):
-        with tf.variable_scope("main{}".format(n)):
+    for n in range(num_layers - 1):
+        with tf.variable_scope("input{}".format(n)):
             r = 2 ** n
             l = r * (filt_size - 1)
             norm = normalize(skip, 2)
@@ -54,32 +55,54 @@ def build_gen_model(x, z):
             A = norm[:, :, :hidden_size]
             B = norm[:, :, hidden_size:]
             act = A * tf.sigmoid(B)
-            next_state.append(act)
             # Atrous Convolution
             filt = tf.get_variable("filt",
                 [filt_size, hidden_size, hidden_size * 2],
                 initializer=init_with_variance(2 / hidden_size))
-            act = tf.pad(act, [[0, 0], [l, 0], [0, 0]])
+            conv = tf.nn.convolution(act, filt, "VALID", dilation_rate=[r])
+            # Residual Skip Connection
+            skip = skip[:, l:] + conv
+    skip = tf.tile(skip, [1, output_size, 1])
+    for n in range(num_layers):
+        with tf.variable_scope("main{}".format(n)):
+            r = 2 ** n
+            l = r * (filt_size - 1)
+            norm = normalize(skip, 2)
+            # Gated Linar Unit
+            A = norm[:, :, :hidden_size]
+            B = norm[:, :, hidden_size:]
+            act = A * tf.sigmoid(B)
+            # Atrous Convolution
+            padding = tf.random_normal([tf.shape(x)[0], l, hidden_size])
+            act = tf.concat([padding, act], 1)
+            filt = tf.get_variable("filt",
+                [filt_size, hidden_size, hidden_size * 2],
+                initializer=init_with_variance(2 / hidden_size))
             conv = tf.nn.convolution(act, filt, "VALID", dilation_rate=[r])
             # Residual Skip Connection
             skip += conv
-    with tf.variable_scope("post{}".format(n)):
+    with tf.variable_scope("post"):
         norm = normalize(skip, 2)
-        # ReLU Activation
+        # ReLU activation
         act = tf.concat([tf.nn.relu(norm), tf.nn.relu(-norm)], 2)
         # 1x1 Convolution
         filt = tf.get_variable("filt",
             [1, hidden_size * 4, len(voca)],
             initializer=init_with_variance(1 / hidden_size))
         conv = tf.nn.convolution(act, filt, "VALID")
-        out = normalize(conv, 2, "final")
-    return out, tf.stack(next_state)
+        # Normalize Variance
+        mean, var = tf.nn.moments(conv, [2], keep_dims=True)
+        eps = 1e-05
+        std = tf.sqrt(var + eps)
+        exp_mean = 1 / len(voca)
+        exp_dev = np.sqrt(len(voca) - 1) / len(voca)
+        out = (conv - mean + exp_mean) / std * exp_dev
+    return out
 
 def build_critic_model(x, y):
-    print(seq_size, x.get_shape())
     with tf.variable_scope("pre"):
-        x = tf.concat([x, y], 2)
-        filt = tf.get_variable("filt", [1, len(voca) * 2, hidden_size * 2],
+        x = tf.concat([x, y], 1)
+        filt = tf.get_variable("filt", [1, len(voca), hidden_size * 2],
             initializer=tf.random_normal_initializer())
         skip = tf.nn.convolution(x, filt, "VALID")
     for n in range(num_layers):
@@ -101,11 +124,10 @@ def build_critic_model(x, y):
     return conv
 
 global_step = tf.get_variable("step", [], initializer=tf.zeros_initializer())
-data = tf.placeholder(tf.int32, [None, seq_size + 1], "data")
-noise = tf.random_normal([tf.shape(data)[0], seq_size, 1])
+data = tf.placeholder(tf.int32, [None, seq_size], "data")
 one_hot = tf.one_hot(data, len(voca))
-x = one_hot[:, :-1]
-y = one_hot[:, 1:]
+x = one_hot[:, :input_size]
+y = one_hot[:, input_size:]
 
 build_gen_model = tf.make_template('gen', build_gen_model)
 build_critic_model = tf.make_template('critic', build_critic_model)
@@ -117,7 +139,7 @@ with tf.variable_scope('clip'):
     clipped = [p.assign(tf.clip_by_value(p, -clip, clip)) for p in c_params]
 
 with tf.control_dependencies(clipped):
-    gen, next_c_state = build_gen_model(x, noise)
+    gen = build_gen_model(x)
     fake = tf.reduce_mean(build_critic_model(x, gen))
     C = fake - real
     c_optimizer = tf.train.RMSPropOptimizer(learning_rate)
@@ -130,7 +152,7 @@ c_summ = tf.summary.merge([
     ])
 
 # Generator
-gen, next_g_state = build_gen_model(x, noise)
+gen = build_gen_model(x)
 G = tf.reduce_mean(-build_critic_model(x, gen))
 
 g_params = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope="gen")
@@ -143,10 +165,10 @@ g_summ = tf.summary.merge([
     ])
 
 # Inference Model
-seed = tf.placeholder(tf.int32, [1], "seed")
-seed_one_hot = tf.one_hot(seed[None, :], len(voca))
-noise = tf.random_normal([1, 1, 1])
-pred, next_state = build_gen_model(seed_one_hot, noise)
+#seed = tf.placeholder(tf.int32, [1], "seed")
+#seed_one_hot = tf.one_hot(seed[None, :], len(voca))
+#noise = tf.random_normal([1, 1, 1])
+#pred, next_state = build_gen_model(seed_one_hot, noise)
 
 # Training
 saver = tf.train.Saver()
@@ -190,8 +212,8 @@ with open('shakespeare.txt') as f:
     dataset = [dic[c] for c in dataset]
 
 def fetch_data():
-    s = random.sample(range(len(dataset) - seq_size - 1), batch_size)
-    feed = {data: [dataset[s:s + seq_size + 1] for s in s]}
+    s = random.sample(range(len(dataset) - seq_size), batch_size)
+    feed = {data: [dataset[s:s + seq_size] for s in s]}
     return feed
 
 while True:
