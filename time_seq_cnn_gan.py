@@ -9,7 +9,7 @@ import random, itertools, os
 load_from = None
 save_to = '../models/chargan_block/'
 #load_from = save_to
-log_dir = '../log/tflogs5/'
+log_dir = '../log/tflogs6/'
 
 voca = " 0123456789abcdefghijklmnopqrstuvwxyz" \
     + "ABCDEFGHIJKLMNOPQRSTUVWXYZ.!;:,?&$'-\n"
@@ -21,8 +21,8 @@ output_size = (2 ** (num_layers - 1)) * (filt_size - 1)
 seq_size = input_size + output_size
 hidden_size = 200
 num_post = 3
-batch_size = 5
-num_critic = 3
+batch_size = 2
+num_critic = 1
 clip = 0.01
 learning_rate = 5e-5
 
@@ -56,40 +56,49 @@ def build_gen_model(x):
             B = norm[:, :, hidden_size:]
             act = A * tf.sigmoid(B)
             # Atrous Convolution
-            filt = tf.get_variable("filt",
-                [filt_size, hidden_size, hidden_size * 2],
-                initializer=init_with_variance(2 / hidden_size))
-            conv = tf.nn.convolution(act, filt, "VALID", dilation_rate=[r])
-            # Residual Skip Connection
-            skip = skip[:, l:] + conv
-    skip = tf.tile(skip, [1, output_size, 1])
-    for n in range(num_layers):
-        with tf.variable_scope("main{}".format(n)):
-            r = 2 ** n
-            l = r * (filt_size - 1)
-            norm = normalize(skip, 2)
-            # Gated Linar Unit
-            A = norm[:, :, :hidden_size]
-            B = norm[:, :, hidden_size:]
-            act = A * tf.sigmoid(B)
-            # Atrous Convolution
-            padding = tf.random_normal([tf.shape(x)[0], l, hidden_size])
-            act = tf.concat([padding, act], 1)
+            act = tf.pad(act, [[0, 0], [l, 0], [0, 0]])
             filt = tf.get_variable("filt",
                 [filt_size, hidden_size, hidden_size * 2],
                 initializer=init_with_variance(2 / hidden_size))
             conv = tf.nn.convolution(act, filt, "VALID", dilation_rate=[r])
             # Residual Skip Connection
             skip += conv
+    skip = tf.reduce_mean(skip, 1, keep_dims=True)
+    skip = tf.tile(skip, [1, output_size, 1])
+    for m in range(3):
+        for n in range(num_layers):
+            with tf.variable_scope("main{}.{}".format(m, n)):
+                r = 2 ** n
+                l = r * (filt_size - 1)
+                noise = tf.random_normal(tf.shape(skip))
+                norm = normalize(skip, 2) * noise
+                # Gated Linar Unit
+                A = norm[:, :, :hidden_size]
+                B = norm[:, :, hidden_size:]
+                act = A * tf.sigmoid(B)
+                # Atrous Convolution
+                filt = tf.get_variable("filt",
+                    [filt_size, hidden_size, hidden_size * 2],
+                    initializer=init_with_variance(2 / hidden_size))
+                conv = tf.nn.convolution(act, filt, "SAME", dilation_rate=[r])
+                # Residual Skip Connection
+                skip += conv
     with tf.variable_scope("post"):
         norm = normalize(skip, 2)
         # ReLU activation
         act = tf.concat([tf.nn.relu(norm), tf.nn.relu(-norm)], 2)
         # 1x1 Convolution
         filt = tf.get_variable("filt",
-            [1, hidden_size * 4, len(voca)],
+            [1, hidden_size * 4, hidden_size],
             initializer=init_with_variance(1 / hidden_size))
         conv = tf.nn.convolution(act, filt, "VALID")
+        norm = normalize(conv, 2, "norm2")
+        act = tf.concat([tf.nn.relu(norm), tf.nn.relu(-norm)], 2)
+        # Second 1x1 Convolution
+        filt2 = tf.get_variable("filt2",
+            [1, hidden_size * 2, len(voca)],
+            initializer=init_with_variance(1 / hidden_size))
+        conv = tf.nn.convolution(act, filt2, "VALID")
         # Normalize Variance
         mean, var = tf.nn.moments(conv, [2], keep_dims=True)
         eps = 1e-05
@@ -115,13 +124,25 @@ def build_critic_model(x, y):
             B = norm[:, :, hidden_size:]
             act = A * tf.sigmoid(B)
             # Atrous Convolution
+            act = tf.pad(act, [[0, 0], [l, 0], [0, 0]])
             filt = tf.get_variable("filt",
                 [filt_size, hidden_size, hidden_size * 2],
                 initializer=init_with_variance(2 / hidden_size))
             conv = tf.nn.convolution(act, filt, "VALID", dilation_rate=[r])
             # Residual Skip Connection
-            skip = skip[:, l:] + conv
-    return conv
+            skip += conv
+    with tf.variable_scope("out"):
+        skip = normalize(skip, 2)
+        mean = tf.reduce_mean(skip, 1)
+        act = tf.concat([tf.nn.relu(mean), tf.nn.relu(-mean)], 1)
+        W1 = tf.get_variable("W1", [hidden_size * 4, hidden_size],
+            initializer=init_with_variance(2 / (hidden_size * 4)))
+        y1 = normalize(tf.matmul(act, W1), 1, "norm2")
+        act = tf.concat([tf.nn.relu(y1), tf.nn.relu(-y1)], 1)
+        W2 = tf.get_variable("W2", [hidden_size * 2, 1],
+            initializer=init_with_variance(2 / (hidden_size * 2)))
+        y2 = tf.matmul(act, W2)
+    return y2
 
 global_step = tf.get_variable("step", [], initializer=tf.zeros_initializer())
 data = tf.placeholder(tf.int32, [None, seq_size], "data")
